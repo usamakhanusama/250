@@ -312,3 +312,14 @@ func (s *Service) ChangePassword(ctx context.Context, userID, oldPass, newPass s
 
 	return tx.Commit(ctx)
 }
+
+// Day 2 Enhancement: In-Memory Token Revocation & Blacklist
+var revokedTokenStore = make(map[string]bool)
+
+func RevokeToken(token string) {
+	revokedTokenStore[token] = true
+}
+
+func IsTokenRevoked(token string) bool {
+	return revokedTokenStore[token]
+}

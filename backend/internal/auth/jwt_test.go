@@ -71,3 +71,14 @@ func TestHashTokenConsistency(t *testing.T) {
 		t.Fatalf("SHA-256 hash must be deterministic: %s != %s", hash1, hash2)
 	}
 }
+
+func TestTokenRevocation(t *testing.T) {
+	fakeToken := "dummy.jwt.token.string"
+	if IsTokenRevoked(fakeToken) {
+		t.Errorf("Expected token to not be revoked initially")
+	}
+	RevokeToken(fakeToken)
+	if !IsTokenRevoked(fakeToken) {
+		t.Errorf("Expected token to be marked as revoked")
+	}
+}

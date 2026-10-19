@@ -28,3 +28,14 @@ func TestTranscriptRetrieval(t *testing.T) {
 		t.Errorf("expected 54.0 total credits, got %f", tr.TotalCredits)
 	}
 }
+
+func TestGetSemesterSummary(t *testing.T) {
+	svc := NewService()
+	rec, found := svc.GetSemesterSummary("2023331020", 3)
+	if !found {
+		t.Fatalf("Expected semester 3 record to exist for Afif")
+	}
+	if rec.GPA != 3.72 {
+		t.Errorf("Expected GPA 3.72, got %.2f", rec.GPA)
+	}
+}

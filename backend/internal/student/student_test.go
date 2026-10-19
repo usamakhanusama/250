@@ -40,3 +40,16 @@ func TestStudentProfileLookup(t *testing.T) {
 		t.Errorf("unexpected profile data: %+v", st)
 	}
 }
+
+func TestFilterBySection(t *testing.T) {
+	svc := NewService()
+	secBList := svc.GetStudentsBySection("B")
+	if len(secBList) == 0 {
+		t.Errorf("Expected students in Section B, got 0")
+	}
+	for _, st := range secBList {
+		if st.Section != "B" {
+			t.Errorf("Expected Section B student, got %s", st.Section)
+		}
+	}
+}

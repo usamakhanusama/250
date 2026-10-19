@@ -141,3 +141,17 @@ func (s *Service) SimulateTargetGPA(reg string, targetCGPA float64, newCredits f
 		Message:        message,
 	}
 }
+
+// Day 2 Enhancement: Specific Semester Grade Breakdown Lookup
+func (s *Service) GetSemesterSummary(reg string, sem int) (*SemesterRecord, bool) {
+	t, found := s.GetTranscriptByRegistration(reg)
+	if !found {
+		return nil, false
+	}
+	for _, sr := range t.SemesterReport {
+		if sr.Semester == sem {
+			return &sr, true
+		}
+	}
+	return nil, false
+}

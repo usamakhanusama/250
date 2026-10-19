@@ -130,3 +130,15 @@ func (s *Service) SearchStudents(query string) []StudentProfile {
 	}
 	return results
 }
+
+// Day 2 Enhancement: Filter Students by Section (A or B)
+func (s *Service) GetStudentsBySection(sec string) []StudentProfile {
+	target := strings.ToUpper(strings.TrimSpace(sec))
+	var res []StudentProfile
+	for _, st := range s.students {
+		if strings.ToUpper(st.Section) == target {
+			res = append(res, st)
+		}
+	}
+	return res
+}

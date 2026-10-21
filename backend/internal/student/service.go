@@ -142,3 +142,30 @@ func (s *Service) GetStudentsBySection(sec string) []StudentProfile {
 	}
 	return res
 }
+
+// Day 3 Implementation: Validate Credit Cap (Max 25.0 credits per semester in SUST)
+const MaxSemesterCredits = 25.0
+
+func (s *Service) ValidateAndEnrollCourse(reg string, courseCode string, courseCredits float64) CourseEnrollmentResponse {
+	// Baseline 4th semester enrolled credits is 22.5
+	currentCredits := 22.5
+	projectedCredits := currentCredits + courseCredits
+
+	if projectedCredits > MaxSemesterCredits {
+		return CourseEnrollmentResponse{
+			RegistrationNumber: reg,
+			CourseCode:         courseCode,
+			TotalCredits:       projectedCredits,
+			Allowed:            false,
+			Message:            "Credit cap exceeded! Maximum allowed semester load in SUST CSE is 25.0 credits.",
+		}
+	}
+
+	return CourseEnrollmentResponse{
+		RegistrationNumber: reg,
+		CourseCode:         courseCode,
+		TotalCredits:       projectedCredits,
+		Allowed:            true,
+		Message:            "Course enrollment validated and approved within semester credit bounds.",
+	}
+}

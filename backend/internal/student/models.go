@@ -24,3 +24,18 @@ type BatchAnalytics struct {
 	EvenRollRule  string `json:"evenRollRule"`
 	OddRollRule   string `json:"oddRollRule"`
 }
+
+// Day 3 Models: Course Enrollment & Credit Cap Validation
+type CourseEnrollmentRequest struct {
+	RegistrationNumber string  `json:"registrationNumber"`
+	CourseCode         string  `json:"courseCode"`
+	Credits            float64 `json:"credits"`
+}
+
+type CourseEnrollmentResponse struct {
+	RegistrationNumber string  `json:"registrationNumber"`
+	CourseCode         string  `json:"courseCode"`
+	TotalCredits       float64 `json:"totalCredits"`
+	Allowed            bool    `json:"allowed"`
+	Message            string  `json:"message"`
+}

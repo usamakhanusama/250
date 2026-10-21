@@ -154,6 +154,7 @@ func main() {
 		api.Route("/students", func(studentRouter chi.Router) {
 			studentRouter.Get("/", studentHandler.GetAllStudents)
 			studentRouter.Get("/analytics", studentHandler.GetAnalytics)
+			studentRouter.Post("/enroll", studentHandler.EnrollCourse)
 			studentRouter.Get("/{reg}", studentHandler.GetStudentProfile)
 		})
 

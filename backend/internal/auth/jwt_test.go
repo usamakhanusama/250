@@ -13,7 +13,7 @@ func TestJWTGenerateAndValidate(t *testing.T) {
 	userID := "user-1234-uuid"
 	role := "student"
 
-	tokens, hash, err := GenerateTokenPair(userID, role, accessSecret, refreshSecret, 15*time.Minute, 7*24*time.Hour)
+	tokens, hash, err := GenerateTokenPair(userID, role, "2023331020", accessSecret, refreshSecret, 15*time.Minute, 7*24*time.Hour)
 	if err != nil {
 		t.Fatalf("expected no error generating tokens, got: %v", err)
 	}
@@ -34,6 +34,10 @@ func TestJWTGenerateAndValidate(t *testing.T) {
 
 	if claims.UserID != userID {
 		t.Errorf("expected userID %s, got %s", userID, claims.UserID)
+	}
+
+	if claims.RegNo != "2023331020" {
+		t.Errorf("expected reg_no claim 2023331020, got %s", claims.RegNo)
 	}
 
 	if claims.Role != role {
@@ -69,16 +73,5 @@ func TestHashTokenConsistency(t *testing.T) {
 
 	if hash1 != hash2 {
 		t.Fatalf("SHA-256 hash must be deterministic: %s != %s", hash1, hash2)
-	}
-}
-
-func TestTokenRevocation(t *testing.T) {
-	fakeToken := "dummy.jwt.token.string"
-	if IsTokenRevoked(fakeToken) {
-		t.Errorf("Expected token to not be revoked initially")
-	}
-	RevokeToken(fakeToken)
-	if !IsTokenRevoked(fakeToken) {
-		t.Errorf("Expected token to be marked as revoked")
 	}
 }

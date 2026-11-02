@@ -7,319 +7,206 @@ import (
 	"time"
 
 	"sust-cse-portal/internal/config"
-	"sust-cse-portal/internal/db"
-
-	"github.com/jackc/pgx/v5"
 )
 
 var (
-	ErrUserNotFound      = errors.New("user not found")
-	ErrInvalidCredentials = errors.New("invalid email or password")
-	ErrAccountLocked     = errors.New("account is locked due to too many failed login attempts")
-	ErrEmailExists       = errors.New("email is already registered")
+	ErrUserNotFound        = errors.New("user not found")
+	ErrInvalidCredentials  = errors.New("invalid registration number/email or password")
+	ErrAccountLocked       = errors.New("account is temporarily locked due to too many failed login attempts")
+	ErrEmailExists         = errors.New("this email is already registered")
+	ErrRegNoExists         = errors.New("this registration number is already registered")
 	ErrInvalidRefreshToken = errors.New("invalid or revoked refresh token")
+	ErrWrongOldPassword    = errors.New("current password is incorrect")
 )
 
+// dummyHash is a real bcrypt hash used when the user does not exist.
+// We still run bcrypt on it so "wrong user" and "wrong password" take the
+// same time; otherwise an attacker could time responses to find valid reg numbers.
+var dummyHash, _ = HashPassword("dummy-password-for-timing-1")
+
 type Service struct {
-	db  *db.DB
-	cfg *config.Config
+	store Store
+	cfg   *config.Config
 }
 
-func NewService(database *db.DB, cfg *config.Config) *Service {
-	return &Service{
-		db:  database,
-		cfg: cfg,
-	}
+func NewService(store Store, cfg *config.Config) *Service {
+	return &Service{store: store, cfg: cfg}
 }
 
-// Register creates a new user account (Admin only)
-func (s *Service) Register(ctx context.Context, req RegisterRequest) (*UserResponse, error) {
-	// Check if email already exists
-	var exists bool
-	err := s.db.Pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)", req.Email).Scan(&exists)
+// Signup: public student self-registration (only 2023331XXX reg numbers allowed).
+// On success the student is logged in immediately (tokens are returned).
+func (s *Service) Signup(ctx context.Context, req SignupRequest) (*LoginResponse, error) {
+	normalizeSignup(&req)
+
+	if err := ValidateRegNo(req.RegNo); err != nil {
+		return nil, err
+	}
+	if len(req.FullName) < 3 || len(req.FullName) > 100 {
+		return nil, ErrInvalidName
+	}
+	if req.Password != req.ConfirmPassword {
+		return nil, ErrPasswordsDiffer
+	}
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		return nil, err
+	}
+
+	// Only the bcrypt hash is stored, never the plain password.
+	hash, err := HashPassword(req.Password)
 	if err != nil {
-		return nil, fmt.Errorf("failed checking email existence: %w", err)
-	}
-	if exists {
-		return nil, ErrEmailExists
+		return nil, err
 	}
 
-	hashedPassword, err := HashPassword(req.Password)
+	user, err := s.store.CreateStudent(ctx, req.Email, hash, req.RegNo, req.FullName)
 	if err != nil {
-		return nil, fmt.Errorf("failed hashing password: %w", err)
+		return nil, err
 	}
-
-	var user UserResponse
-	err = s.db.Pool.QueryRow(ctx, `
-		INSERT INTO users (email, password_hash, role)
-		VALUES ($1, $2, $3)
-		RETURNING id, email, role, created_at
-	`, req.Email, hashedPassword, req.Role).Scan(&user.ID, &user.Email, &user.Role, &user.CreatedAt)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed creating user: %w", err)
-	}
-
-	return &user, nil
+	return s.issueTokens(ctx, user)
 }
 
-// Login authenticates a user with brute-force protection
+// Login checks the password with bcrypt and locks the account after too many failures.
 func (s *Service) Login(ctx context.Context, req LoginRequest) (*LoginResponse, error) {
-	var (
-		userID        string
-		passwordHash  string
-		role          string
-		failedAttempts int
-		lockedUntil   *time.Time
-		createdAt     time.Time
-	)
-
-	err := s.db.Pool.QueryRow(ctx, `
-		SELECT id, password_hash, role, failed_login_attempts, locked_until, created_at
-		FROM users
-		WHERE email = $1
-	`, req.Email).Scan(&userID, &passwordHash, &role, &failedAttempts, &lockedUntil, &createdAt)
-
+	user, err := s.store.FindByLogin(ctx, req.Login)
+	if errors.Is(err, ErrUserNotFound) {
+		CheckPassword(dummyHash, req.Password) // same timing as a real check
+		return nil, ErrInvalidCredentials
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrInvalidCredentials
-		}
-		return nil, fmt.Errorf("database query error: %w", err)
+		return nil, fmt.Errorf("looking up user: %w", err)
 	}
 
 	now := time.Now()
 
-	// 1. Check if account is currently locked
-	if lockedUntil != nil && lockedUntil.After(now) {
-		remaining := time.Until(*lockedUntil).Round(time.Minute)
-		return nil, fmt.Errorf("%w: please try again after %v", ErrAccountLocked, remaining)
+	// 1. Account lockout (per-account brute-force protection)
+	if user.LockedUntil != nil && user.LockedUntil.After(now) {
+		return nil, ErrAccountLocked
 	}
 
-	// 2. Validate password
-	if !CheckPassword(passwordHash, req.Password) {
-		failedAttempts++
-		if failedAttempts >= s.cfg.MaxLoginAttempts {
-			newLock := now.Add(s.cfg.LockoutDuration)
-			_, _ = s.db.Pool.Exec(ctx, `
-				UPDATE users
-				SET failed_login_attempts = $1, locked_until = $2
-				WHERE id = $3
-			`, failedAttempts, newLock, userID)
-			return nil, fmt.Errorf("%w: account locked for %v", ErrAccountLocked, s.cfg.LockoutDuration)
+	// 2. Compare password with stored bcrypt hash
+	if !CheckPassword(user.PasswordHash, req.Password) {
+		attempts := user.FailedAttempts + 1
+		var lockUntil *time.Time
+		if attempts >= s.cfg.MaxLoginAttempts {
+			t := now.Add(s.cfg.LockoutDuration)
+			lockUntil = &t
 		}
-
-		_, _ = s.db.Pool.Exec(ctx, `
-			UPDATE users
-			SET failed_login_attempts = $1
-			WHERE id = $2
-		`, failedAttempts, userID)
-
-		remainingAttempts := s.cfg.MaxLoginAttempts - failedAttempts
-		return nil, fmt.Errorf("%w (%d attempt(s) remaining before account lockout)", ErrInvalidCredentials, remainingAttempts)
-	}
-
-	// 3. Reset failed attempts on successful login
-	_, _ = s.db.Pool.Exec(ctx, `
-		UPDATE users
-		SET failed_login_attempts = 0, locked_until = NULL
-		WHERE id = $1
-	`, userID)
-
-	// 4. Generate JWT Token Pair
-	tokenPair, tokenHash, err := GenerateTokenPair(
-		userID,
-		role,
-		s.cfg.JWTSecret,
-		s.cfg.JWTRefreshSecret,
-		s.cfg.JWTAccessExpiry,
-		s.cfg.JWTRefreshExpiry,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed generating tokens: %w", err)
-	}
-
-	// 5. Save hashed refresh token in database
-	expiresAt := now.Add(s.cfg.JWTRefreshExpiry)
-	_, err = s.db.Pool.Exec(ctx, `
-		INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-		VALUES ($1, $2, $3)
-	`, userID, tokenHash, expiresAt)
-	if err != nil {
-		return nil, fmt.Errorf("failed saving refresh token: %w", err)
-	}
-
-	userRes := UserResponse{
-		ID:        userID,
-		Email:     req.Email,
-		Role:      role,
-		CreatedAt: createdAt,
-	}
-
-	if role == "student" {
-		var st StudentProfileBrief
-		_ = s.db.Pool.QueryRow(ctx, "SELECT id, reg_no, full_name, current_semester FROM students WHERE user_id = $1", userID).Scan(&st.StudentID, &st.RegNo, &st.FullName, &st.CurrentSemester)
-		if st.StudentID != "" {
-			userRes.Student = &st
+		_ = s.store.SetLoginFailures(ctx, user.ID, attempts, lockUntil)
+		if lockUntil != nil {
+			return nil, ErrAccountLocked
 		}
-	} else if role == "teacher" {
-		var tp TeacherProfileBrief
-		_ = s.db.Pool.QueryRow(ctx, "SELECT id, teacher_code, full_name FROM teachers WHERE user_id = $1", userID).Scan(&tp.TeacherID, &tp.TeacherCode, &tp.FullName)
-		if tp.TeacherID != "" {
-			userRes.Teacher = &tp
-		}
+		// Same message as "user not found", so attackers can't tell which reg numbers exist.
+		return nil, ErrInvalidCredentials
 	}
 
-	return &LoginResponse{
-		User:         userRes,
-		AccessToken:  tokenPair.AccessToken,
-		RefreshToken: tokenPair.RefreshToken,
-		ExpiresAt:    tokenPair.ExpiresAt,
-	}, nil
+	// 3. Success: reset the failure counter and issue JWTs
+	_ = s.store.SetLoginFailures(ctx, user.ID, 0, nil)
+	return s.issueTokens(ctx, user)
 }
 
-// Refresh handles token rotation using valid refresh tokens
-func (s *Service) Refresh(ctx context.Context, refreshTokenStr string) (*LoginResponse, error) {
-	// Validate refresh token signature & claims
-	_, err := ValidateToken(refreshTokenStr, s.cfg.JWTRefreshSecret)
+// Refresh exchanges a valid refresh token for a new pair (token rotation:
+// the old refresh token is revoked so it can't be reused if stolen).
+func (s *Service) Refresh(ctx context.Context, refreshToken string) (*LoginResponse, error) {
+	if _, err := ValidateToken(refreshToken, s.cfg.JWTRefreshSecret); err != nil {
+		return nil, ErrInvalidRefreshToken
+	}
+
+	tokenHash := HashToken(refreshToken)
+	rt, err := s.store.FindRefreshToken(ctx, tokenHash)
+	if err != nil || rt.Revoked || rt.ExpiresAt.Before(time.Now()) {
+		return nil, ErrInvalidRefreshToken
+	}
+
+	user, err := s.store.FindByID(ctx, rt.UserID)
 	if err != nil {
 		return nil, ErrInvalidRefreshToken
 	}
 
-	tokenHash := HashToken(refreshTokenStr)
-
-	// Verify token exists in database and is not revoked
-	var (
-		tokenID   string
-		userID    string
-		revoked   bool
-		expiresAt time.Time
-		role      string
-		email     string
-		createdAt time.Time
-	)
-
-	err = s.db.Pool.QueryRow(ctx, `
-		SELECT rt.id, rt.user_id, rt.revoked, rt.expires_at, u.role, u.email, u.created_at
-		FROM refresh_tokens rt
-		JOIN users u ON u.id = rt.user_id
-		WHERE rt.token_hash = $1
-	`, tokenHash).Scan(&tokenID, &userID, &revoked, &expiresAt, &role, &email, &createdAt)
-
-	if err != nil {
-		return nil, ErrInvalidRefreshToken
-	}
-
-	if revoked || expiresAt.Before(time.Now()) {
-		return nil, ErrInvalidRefreshToken
-	}
-
-	// Revoke the used refresh token (Token Rotation)
-	_, _ = s.db.Pool.Exec(ctx, "UPDATE refresh_tokens SET revoked = TRUE WHERE id = $1", tokenID)
-
-	// Issue new token pair
-	newTokens, newTokenHash, err := GenerateTokenPair(
-		userID,
-		role,
-		s.cfg.JWTSecret,
-		s.cfg.JWTRefreshSecret,
-		s.cfg.JWTAccessExpiry,
-		s.cfg.JWTRefreshExpiry,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed generating new tokens: %w", err)
-	}
-
-	// Save new refresh token hash
-	newExpiresAt := time.Now().Add(s.cfg.JWTRefreshExpiry)
-	_, err = s.db.Pool.Exec(ctx, `
-		INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-		VALUES ($1, $2, $3)
-	`, userID, newTokenHash, newExpiresAt)
-	if err != nil {
-		return nil, fmt.Errorf("failed storing new refresh token: %w", err)
-	}
-
-	userRes := UserResponse{
-		ID:        userID,
-		Email:     email,
-		Role:      role,
-		CreatedAt: createdAt,
-	}
-
-	if role == "student" {
-		var st StudentProfileBrief
-		_ = s.db.Pool.QueryRow(ctx, "SELECT id, reg_no, full_name, current_semester FROM students WHERE user_id = $1", userID).Scan(&st.StudentID, &st.RegNo, &st.FullName, &st.CurrentSemester)
-		if st.StudentID != "" {
-			userRes.Student = &st
-		}
-	} else if role == "teacher" {
-		var tp TeacherProfileBrief
-		_ = s.db.Pool.QueryRow(ctx, "SELECT id, teacher_code, full_name FROM teachers WHERE user_id = $1", userID).Scan(&tp.TeacherID, &tp.TeacherCode, &tp.FullName)
-		if tp.TeacherID != "" {
-			userRes.Teacher = &tp
-		}
-	}
-
-	return &LoginResponse{
-		User:         userRes,
-		AccessToken:  newTokens.AccessToken,
-		RefreshToken: newTokens.RefreshToken,
-		ExpiresAt:    newTokens.ExpiresAt,
-	}, nil
+	_ = s.store.RevokeRefreshToken(ctx, tokenHash)
+	return s.issueTokens(ctx, user)
 }
 
-// Logout revokes the given refresh token
-func (s *Service) Logout(ctx context.Context, refreshTokenStr string) error {
-	tokenHash := HashToken(refreshTokenStr)
-	_, err := s.db.Pool.Exec(ctx, "UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = $1", tokenHash)
-	return err
+// Logout revokes the refresh token so it can no longer be used.
+func (s *Service) Logout(ctx context.Context, refreshToken string) error {
+	return s.store.RevokeRefreshToken(ctx, HashToken(refreshToken))
 }
 
-// ChangePassword updates user password and revokes all active refresh tokens
+// Me returns the safe profile of the logged-in user.
+func (s *Service) Me(ctx context.Context, userID string) (*UserResponse, error) {
+	user, err := s.store.FindByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	res := toUserResponse(user)
+	return &res, nil
+}
+
+// ChangePassword updates the password and logs the user out everywhere.
 func (s *Service) ChangePassword(ctx context.Context, userID, oldPass, newPass string) error {
-	var currentHash string
-	err := s.db.Pool.QueryRow(ctx, "SELECT password_hash FROM users WHERE id = $1", userID).Scan(&currentHash)
+	user, err := s.store.FindByID(ctx, userID)
 	if err != nil {
 		return ErrUserNotFound
 	}
-
-	if !CheckPassword(currentHash, oldPass) {
-		return errors.New("current password is incorrect")
+	if !CheckPassword(user.PasswordHash, oldPass) {
+		return ErrWrongOldPassword
 	}
-
+	if err := ValidatePasswordStrength(newPass); err != nil {
+		return err
+	}
 	newHash, err := HashPassword(newPass)
 	if err != nil {
 		return err
 	}
-
-	tx, err := s.db.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	// Update password
-	_, err = tx.Exec(ctx, "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", newHash, userID)
-	if err != nil {
-		return err
-	}
-
-	// Revoke all existing sessions/refresh tokens for security
-	_, err = tx.Exec(ctx, "UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1", userID)
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
+	return s.store.UpdatePasswordAndRevokeSessions(ctx, userID, newHash)
 }
 
-// Day 2 Enhancement: In-Memory Token Revocation & Blacklist
-var revokedTokenStore = make(map[string]bool)
+// issueTokens creates an access + refresh JWT and stores the refresh token's SHA-256 hash.
+func (s *Service) issueTokens(ctx context.Context, user *UserRecord) (*LoginResponse, error) {
+	regNo := ""
+	if user.Student != nil {
+		regNo = user.Student.RegNo
+	}
 
-func RevokeToken(token string) {
-	revokedTokenStore[token] = true
+	pair, refreshHash, err := GenerateTokenPair(user.ID, user.Role, regNo,
+		s.cfg.JWTSecret, s.cfg.JWTRefreshSecret, s.cfg.JWTAccessExpiry, s.cfg.JWTRefreshExpiry)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.store.SaveRefreshToken(ctx, user.ID, refreshHash, time.Now().Add(s.cfg.JWTRefreshExpiry)); err != nil {
+		return nil, fmt.Errorf("saving refresh token: %w", err)
+	}
+
+	return &LoginResponse{
+		User:         toUserResponse(user),
+		AccessToken:  pair.AccessToken,
+		RefreshToken: pair.RefreshToken,
+		ExpiresAt:    pair.ExpiresAt,
+	}, nil
 }
 
-func IsTokenRevoked(token string) bool {
-	return revokedTokenStore[token]
+// toUserResponse copies only the safe fields. PasswordHash is intentionally dropped here.
+func toUserResponse(u *UserRecord) UserResponse {
+	return UserResponse{
+		ID:        u.ID,
+		Email:     u.Email,
+		Role:      u.Role,
+		Student:   u.Student,
+		CreatedAt: u.CreatedAt,
+	}
+}
+
+// SeedDemoStudents adds the two project members to an empty MemoryStore so the
+// demo works without PostgreSQL. Passwords are bcrypt-hashed here, on the server.
+func SeedDemoStudents(ctx context.Context, store Store) {
+	demo := []struct{ reg, name, email string }{
+		{"2023331020", "Afif Zaman Khan", "afif@student.sust.edu"},
+		{"2023331088", "Usama", "usama@student.sust.edu"},
+	}
+	for _, d := range demo {
+		hash, err := HashPassword("Password@123")
+		if err != nil {
+			continue
+		}
+		_, _ = store.CreateStudent(ctx, d.email, hash, d.reg, d.name)
+	}
 }

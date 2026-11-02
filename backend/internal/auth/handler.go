@@ -2,8 +2,9 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
-	"strings"
 
 	"sust-cse-portal/internal/utils"
 
@@ -16,139 +17,132 @@ type Handler struct {
 }
 
 func NewHandler(service *Service) *Handler {
-	return &Handler{
-		service:  service,
-		validate: validator.New(),
-	}
+	return &Handler{service: service, validate: validator.New()}
 }
 
-// Register handles user registration (Admin only)
-func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
-	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// decodeAndValidate reads the JSON body into dst and runs the `validate:"..."` struct tags.
+// DisallowUnknownFields rejects payloads with extra fields such as {"role":"admin"}.
+func (h *Handler) decodeAndValidate(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
 		utils.Error(w, http.StatusBadRequest, "Invalid request body", nil)
-		return
+		return false
 	}
-
-	if err := h.validate.Struct(req); err != nil {
+	if err := h.validate.Struct(dst); err != nil {
 		utils.Error(w, http.StatusUnprocessableEntity, "Validation error", formatValidationErrors(err))
-		return
+		return false
 	}
-
-	user, err := h.service.Register(r.Context(), req)
-	if err != nil {
-		if err == ErrEmailExists {
-			utils.Error(w, http.StatusConflict, err.Error(), nil)
-			return
-		}
-		utils.Error(w, http.StatusInternalServerError, err.Error(), nil)
-		return
-	}
-
-	utils.Success(w, http.StatusCreated, "User registered successfully", user)
+	return true
 }
 
-// Login authenticates users with brute-force lockout
+// POST /api/v1/auth/signup (public, rate limited)
+func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
+	var req SignupRequest
+	if !h.decodeAndValidate(w, r, &req) {
+		return
+	}
+
+	res, err := h.service.Signup(r.Context(), req)
+	switch {
+	case err == nil:
+		utils.Success(w, http.StatusCreated, "Account created successfully", res)
+	case errors.Is(err, ErrRegNoExists), errors.Is(err, ErrEmailExists):
+		utils.Error(w, http.StatusConflict, err.Error(), nil)
+	case errors.Is(err, ErrInvalidRegNo), errors.Is(err, ErrWeakPassword),
+		errors.Is(err, ErrInvalidName), errors.Is(err, ErrPasswordsDiffer):
+		utils.Error(w, http.StatusUnprocessableEntity, err.Error(), nil)
+	default:
+		internalError(w, "signup", err)
+	}
+}
+
+// POST /api/v1/auth/login (public, rate limited)
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.Error(w, http.StatusBadRequest, "Invalid request body", nil)
-		return
-	}
-
-	if err := h.validate.Struct(req); err != nil {
-		utils.Error(w, http.StatusUnprocessableEntity, "Validation error", formatValidationErrors(err))
+	if !h.decodeAndValidate(w, r, &req) {
 		return
 	}
 
 	res, err := h.service.Login(r.Context(), req)
-	if err != nil {
-		if strings.Contains(err.Error(), "locked") {
-			utils.Error(w, http.StatusForbidden, err.Error(), nil)
-			return
-		}
+	switch {
+	case err == nil:
+		utils.Success(w, http.StatusOK, "Login successful", res)
+	case errors.Is(err, ErrAccountLocked):
+		utils.Error(w, http.StatusForbidden, err.Error(), nil)
+	case errors.Is(err, ErrInvalidCredentials):
 		utils.Error(w, http.StatusUnauthorized, err.Error(), nil)
-		return
+	default:
+		internalError(w, "login", err)
 	}
-
-	utils.Success(w, http.StatusOK, "Login successful", res)
 }
 
-// Refresh handles token rotation
+// POST /api/v1/auth/refresh
 func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 	var req RefreshRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.Error(w, http.StatusBadRequest, "Invalid request body", nil)
+	if !h.decodeAndValidate(w, r, &req) {
 		return
 	}
-
-	if err := h.validate.Struct(req); err != nil {
-		utils.Error(w, http.StatusUnprocessableEntity, "Validation error", formatValidationErrors(err))
-		return
-	}
-
 	res, err := h.service.Refresh(r.Context(), req.RefreshToken)
 	if err != nil {
-		utils.Error(w, http.StatusUnauthorized, err.Error(), nil)
+		utils.Error(w, http.StatusUnauthorized, ErrInvalidRefreshToken.Error(), nil)
 		return
 	}
-
 	utils.Success(w, http.StatusOK, "Token refreshed successfully", res)
 }
 
-// Logout revokes refresh token
+// POST /api/v1/auth/logout
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	var req LogoutRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.Error(w, http.StatusBadRequest, "Invalid request body", nil)
+	if !h.decodeAndValidate(w, r, &req) {
 		return
 	}
-
 	_ = h.service.Logout(r.Context(), req.RefreshToken)
 	utils.Success(w, http.StatusOK, "Logged out successfully", nil)
 }
 
-// ChangePassword allows authenticated users to update their password
-func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
-	userID, ok := r.Context().Value("user_id").(string)
-	if !ok || userID == "" {
-		utils.Error(w, http.StatusUnauthorized, "Unauthorized", nil)
-		return
-	}
-
-	var req ChangePasswordRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		utils.Error(w, http.StatusBadRequest, "Invalid request body", nil)
-		return
-	}
-
-	if err := h.validate.Struct(req); err != nil {
-		utils.Error(w, http.StatusUnprocessableEntity, "Validation error", formatValidationErrors(err))
-		return
-	}
-
-	if err := h.service.ChangePassword(r.Context(), userID, req.OldPassword, req.NewPassword); err != nil {
-		utils.Error(w, http.StatusBadRequest, err.Error(), nil)
-		return
-	}
-
-	utils.Success(w, http.StatusOK, "Password updated successfully. Please login again.", nil)
-}
-
-// Me returns the currently authenticated user's ID and Role
+// GET /api/v1/auth/me (requires JWT)
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	userID, _ := r.Context().Value("user_id").(string)
-	role, _ := r.Context().Value("role").(string)
+	user, err := h.service.Me(r.Context(), userID)
+	if err != nil {
+		utils.Error(w, http.StatusUnauthorized, "User no longer exists", nil)
+		return
+	}
+	utils.Success(w, http.StatusOK, "Authenticated profile retrieved", user)
+}
 
-	utils.Success(w, http.StatusOK, "Authenticated profile retrieved", map[string]interface{}{
-		"user_id": userID,
-		"role":    role,
-	})
+// POST /api/v1/auth/change-password (requires JWT)
+func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value("user_id").(string)
+
+	var req ChangePasswordRequest
+	if !h.decodeAndValidate(w, r, &req) {
+		return
+	}
+
+	err := h.service.ChangePassword(r.Context(), userID, req.OldPassword, req.NewPassword)
+	switch {
+	case err == nil:
+		utils.Success(w, http.StatusOK, "Password updated successfully. Please login again.", nil)
+	case errors.Is(err, ErrWrongOldPassword), errors.Is(err, ErrWeakPassword):
+		utils.Error(w, http.StatusBadRequest, err.Error(), nil)
+	default:
+		internalError(w, "change-password", err)
+	}
+}
+
+// internalError logs the real error on the server but sends only a generic
+// message to the client, so database details never leak to the browser.
+func internalError(w http.ResponseWriter, action string, err error) {
+	log.Printf("auth %s error: %v", action, err)
+	utils.Error(w, http.StatusInternalServerError, "Something went wrong. Please try again.", nil)
 }
 
 func formatValidationErrors(err error) []string {
 	var errs []string
-	if valErr, ok := err.(validator.ValidationErrors); ok {
+	var valErr validator.ValidationErrors
+	if errors.As(err, &valErr) {
 		for _, e := range valErr {
 			errs = append(errs, e.Field()+": failed on '"+e.Tag()+"' condition")
 		}

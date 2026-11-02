@@ -16,9 +16,7 @@ import (
 	"sust-cse-portal/internal/course"
 	"sust-cse-portal/internal/db"
 	customMiddleware "sust-cse-portal/internal/middleware"
-	"sust-cse-portal/internal/result"
 	"sust-cse-portal/internal/routine"
-	"sust-cse-portal/internal/student"
 	"sust-cse-portal/internal/utils"
 
 	"github.com/go-chi/chi/v5"
@@ -57,14 +55,22 @@ func main() {
 	}
 
 	// 3. Initialize Services and Handlers
-	var authHandler *auth.Handler
+	// Auth storage: PostgreSQL if connected, otherwise an in-memory store
+	// (so signup/login still work in a local demo without a database).
+	var authStore auth.Store
 	if database != nil {
-		authService := auth.NewService(database, cfg)
-		authHandler = auth.NewHandler(authService)
+		authStore = auth.NewPostgresStore(database)
+	} else {
+		log.Println("⚠️ Using IN-MEMORY auth store (accounts are lost on restart). Demo users: 2023331020 / 2023331088, password Password@123")
+		memStore := auth.NewMemoryStore()
+		auth.SeedDemoStudents(context.Background(), memStore)
+		authStore = memStore
 	}
+	authHandler := auth.NewHandler(auth.NewService(authStore, cfg))
+	requireJWT := customMiddleware.AuthMiddleware(cfg)
 
 	// ============================================================================
-	// AFIF'S GO SERVICES (50% Backend - 3 Packages):
+	// AFIF'S GO SERVICES (Authored by Afif Zaman Khan - 2023331020):
 	// 1. Routine Engine (Timetable, Room Availability, Live Class Tracker)
 	// 2. Course Catalog (Analytics, Prerequisites, Evaluation Schemes)
 	// 3. Attendance Engine (SUST 75% Ordinance & Safe-Bunk Calculator)
@@ -78,22 +84,18 @@ func main() {
 	attendanceService := attendance.NewService()
 	attendanceHandler := attendance.NewHandler(attendanceService)
 
-	// Usama's Go Services (50% Backend): Student Identity & Result Engine
-	studentService := student.NewService()
-	studentHandler := student.NewHandler(studentService)
-
-	resultService := result.NewService()
-	resultHandler := result.NewHandler(resultService)
-
-	// 4. Rate Limiters (Written from scratch with token bucket & cleanup)
-	authRateLimiter := customMiddleware.NewIPRateLimiter(cfg.RateLimitAuthPerMin, 5) // 5 req/min
-	apiRateLimiter := customMiddleware.NewIPRateLimiter(cfg.RateLimitAPIPerMin, 60)   // 60 req/min
+	// 4. Rate Limiters (token bucket written from scratch, see middleware/ratelimit.go)
+	//    auth: 5 requests/min per IP (slows down password guessing & fake signups)
+	//    api:  60 requests/min per IP (protects the server from request floods)
+	authRateLimiter := customMiddleware.NewIPRateLimiter(cfg.RateLimitAuthPerMin, 5)
+	apiRateLimiter := customMiddleware.NewIPRateLimiter(cfg.RateLimitAPIPerMin, 60)
 
 	// 5. Setup Chi Router & Global Middlewares
 	r := chi.NewRouter()
 
 	r.Use(chiMiddleware.RequestID)
-	r.Use(chiMiddleware.RealIP)
+	// NOTE: chiMiddleware.RealIP is intentionally NOT used: it copies the client-controlled
+	// X-Forwarded-For header into RemoteAddr, which would let attackers bypass the rate limiter.
 	r.Use(chiMiddleware.Logger)
 	r.Use(chiMiddleware.Recoverer)
 	r.Use(customMiddleware.SecurityHeadersMiddleware)
@@ -101,7 +103,7 @@ func main() {
 
 	// CORS Setup
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:3000", cfg.FrontendURL},
+		AllowedOrigins:   []string{"http://localhost:3000", "http://localhost:3001", cfg.FrontendURL},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link", "Retry-After"},
@@ -129,73 +131,57 @@ func main() {
 		})
 
 		// ============================================================================
-		// AFIF'S API DOMAIN (50% Go Backend Ownership: routine, course, attendance)
+		// AFIF'S API DOMAIN (Authored by Afif Zaman Khan - 2023331020)
 		// ============================================================================
 		api.Route("/routines", func(routineRouter chi.Router) {
 			routineRouter.Get("/", routineHandler.GetDayRoutine)
 			routineRouter.Get("/weekly", routineHandler.GetWeeklyGrid)
 			routineRouter.Get("/current", routineHandler.GetCurrentClass)
 			routineRouter.Get("/rooms", routineHandler.GetRoomAvailability)
+			routineRouter.Get("/check-room", routineHandler.CheckRoomConflict)
 		})
 
 		api.Route("/courses", func(courseRouter chi.Router) {
 			courseRouter.Get("/", courseHandler.GetCourses)
 			courseRouter.Get("/analytics", courseHandler.GetAnalytics)
 			courseRouter.Post("/prerequisites/check", courseHandler.CheckPrerequisites)
+			courseRouter.Get("/details/{code}", courseHandler.GetCourseDetails)
+			courseRouter.Get("/assignments", courseHandler.GetAssignments)
+			// Submitting work requires a logged-in student (JWT + role check)
+			courseRouter.With(requireJWT, customMiddleware.RequireRoles("student")).
+				Post("/assignments/submit", courseHandler.SubmitAssignment)
 			courseRouter.Get("/{code}", courseHandler.GetCourseByCode)
 		})
 
+		// Attendance is personal data: JWT required, and the student is read from the token
 		api.Route("/attendance", func(attRouter chi.Router) {
+			attRouter.Use(requireJWT, customMiddleware.RequireRoles("student"))
 			attRouter.Get("/", attendanceHandler.GetStudentAttendance)
 			attRouter.Get("/safebunk", attendanceHandler.AnalyzeSafeBunk)
 		})
 
-		// Usama's API Domain: Student Directory & Academic Results
-		api.Route("/students", func(studentRouter chi.Router) {
-			studentRouter.Get("/", studentHandler.GetAllStudents)
-			studentRouter.Get("/analytics", studentHandler.GetAnalytics)
-			studentRouter.Post("/enroll", studentHandler.EnrollCourse)
-			studentRouter.Get("/{reg}", studentHandler.GetStudentProfile)
-		})
-
-		api.Route("/results", func(resultRouter chi.Router) {
-			resultRouter.Get("/transcript/{reg}", resultHandler.GetTranscript)
-			resultRouter.Get("/simulate", resultHandler.SimulateTargetGPA)
-		})
-
 		// Auth Routes
 		api.Route("/auth", func(authRouter chi.Router) {
-			if authHandler == nil {
-				authRouter.HandleFunc("/*", func(w http.ResponseWriter, r *http.Request) {
-					utils.Error(w, http.StatusServiceUnavailable, "Database is not connected. Auth unavailable.", nil)
-				})
-				return
-			}
-
-			// Public auth endpoints with STRICT rate limit (5 req/min)
+			// Public endpoints: protected by the strict auth rate limiter
 			authRouter.Group(func(public chi.Router) {
 				public.Use(customMiddleware.RateLimitMiddleware(authRateLimiter))
+				public.Post("/signup", authHandler.Signup)
 				public.Post("/login", authHandler.Login)
 				public.Post("/refresh", authHandler.Refresh)
 				public.Post("/logout", authHandler.Logout)
 			})
 
-			// Protected auth endpoints
-			authRouter.Group(func(protected chi.Router) {
-				protected.Use(customMiddleware.AuthMiddleware(cfg))
-
-				// Current user profile
-				protected.Get("/me", authHandler.Me)
-				protected.Post("/change-password", authHandler.ChangePassword)
-
-				// Admin-only user registration
-				protected.With(customMiddleware.RequireRoles("admin")).Post("/register", authHandler.Register)
+			// Private endpoints: need "Authorization: Bearer <access_token>"
+			authRouter.Group(func(private chi.Router) {
+				private.Use(requireJWT)
+				private.Get("/me", authHandler.Me)
+				private.Post("/change-password", authHandler.ChangePassword)
 			})
 		})
 	})
 
 	// 7. Start HTTP Server with Graceful Shutdown
-	server := &http.Server{
+	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
@@ -205,23 +191,23 @@ func main() {
 
 	go func() {
 		log.Printf("🚀 Server running on port %s (http://localhost:%s)", cfg.Port, cfg.Port)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("❌ Server listen error: %v", err)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("❌ HTTP server error: %v", err)
 		}
 	}()
 
-	// Wait for terminate signal
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 
 	log.Println("🛑 Shutting down server gracefully...")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("❌ Forced server shutdown: %v", err)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("❌ Server forced to shutdown: %v", err)
 	}
 
-	log.Println("✅ Server exited cleanly.")
+	log.Println("✅ Server gracefully stopped. Goodbye!")
 }

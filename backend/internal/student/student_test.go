@@ -40,32 +40,3 @@ func TestStudentProfileLookup(t *testing.T) {
 		t.Errorf("unexpected profile data: %+v", st)
 	}
 }
-
-func TestFilterBySection(t *testing.T) {
-	svc := NewService()
-	secBList := svc.GetStudentsBySection("B")
-	if len(secBList) == 0 {
-		t.Errorf("Expected students in Section B, got 0")
-	}
-	for _, st := range secBList {
-		if st.Section != "B" {
-			t.Errorf("Expected Section B student, got %s", st.Section)
-		}
-	}
-}
-
-func TestCreditCapValidation(t *testing.T) {
-	svc := NewService()
-
-	// Adding a 1.5 credit lab to 22.5 credits = 24.0 credits <= 25.0 (Approved)
-	resOk := svc.ValidateAndEnrollCourse("2023331088", "CSE 0688 2292", 1.5)
-	if !resOk.Allowed {
-		t.Errorf("Expected 24.0 credits to be approved within 25.0 cap")
-	}
-
-	// Adding 3.5 credits to 22.5 credits = 26.0 credits > 25.0 (Rejected)
-	resExceed := svc.ValidateAndEnrollCourse("2023331088", "EXTRA 9999", 3.5)
-	if resExceed.Allowed {
-		t.Errorf("Expected 26.0 credits to be rejected by credit cap")
-	}
-}

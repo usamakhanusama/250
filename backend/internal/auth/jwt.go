@@ -16,10 +16,13 @@ var (
 	ErrInvalidAlg   = errors.New("unexpected signing method")
 )
 
-// CustomClaims contains ONLY user_id and role as required by strict security rules
+// CustomClaims is what we put inside the JWT payload.
+// A JWT payload is only base64-encoded (anyone can decode it at jwt.io), NOT encrypted,
+// so we only store non-secret identifiers here: never the password or email.
 type CustomClaims struct {
 	UserID string `json:"user_id"`
 	Role   string `json:"role"`
+	RegNo  string `json:"reg_no,omitempty"` // lets handlers know "which student" without trusting the request
 	jwt.RegisteredClaims
 }
 
@@ -31,7 +34,7 @@ type TokenPair struct {
 }
 
 // GenerateTokenPair generates a 15-minute access token and a 7-day refresh token
-func GenerateTokenPair(userID, role, accessSecret, refreshSecret string, accessExpiry, refreshExpiry time.Duration) (*TokenPair, string, error) {
+func GenerateTokenPair(userID, role, regNo, accessSecret, refreshSecret string, accessExpiry, refreshExpiry time.Duration) (*TokenPair, string, error) {
 	now := time.Now()
 	accessExp := now.Add(accessExpiry)
 	refreshExp := now.Add(refreshExpiry)
@@ -40,6 +43,7 @@ func GenerateTokenPair(userID, role, accessSecret, refreshSecret string, accessE
 	accessClaims := CustomClaims{
 		UserID: userID,
 		Role:   role,
+		RegNo:  regNo,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(accessExp),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -58,6 +62,7 @@ func GenerateTokenPair(userID, role, accessSecret, refreshSecret string, accessE
 	refreshClaims := CustomClaims{
 		UserID: userID,
 		Role:   role,
+		RegNo:  regNo,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(refreshExp),
 			IssuedAt:  jwt.NewNumericDate(now),
